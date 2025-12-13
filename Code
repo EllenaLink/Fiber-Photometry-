@@ -1,0 +1,608 @@
+import os
+import pandas as pd
+import numpy as np
+
+# Configure these paths
+input_folder = "/Users/ellenalink/Desktop"  # Folder containing your files
+output_folder = "/Users/ellenalink/Desktop/shansky"
+
+# Create output folder if it doesn't exist
+os.makedirs(output_folder, exist_ok=True)
+
+# Get only the specific data files you want to process
+data_files = [
+    "ER F2 Test Cleaned.txt",
+    "ER-F7 Cleaned Trial Data.txt",
+    "_tone1.txt", "_tone2.txt", "_tone3.txt", 
+    "_tone4.txt", "_tone5.txt", "_tone6.txt"
+]
+
+# Filter to only include files that actually exist
+files = [f for f in data_files if os.path.exists(os.path.join(input_folder, f))]
+
+print(f"Found {len(files)} data files to process\n")
+
+for filename in files:
+    input_path = os.path.join(input_folder, filename)
+    
+    name, ext = os.path.splitext(filename)
+    cleaned_filename = f"{name}_cleaned{ext}"
+    output_path = os.path.join(output_folder, cleaned_filename)
+    
+    try:
+        # Read the file (tab-separated, no header)
+        df = pd.read_csv(input_path, sep='\t', header=None)
+        
+        original_rows = len(df)
+        
+        # keep only rows where column 3 (index 2) is greater than or equal to 1
+        df_cleaned = df[df[2] >= 1].copy()
+        
+        cleaned_rows = len(df_cleaned)
+        removed_rows = original_rows - cleaned_rows
+        
+        # Renumber the first column sequentially starting from 0.00
+        df_cleaned.iloc[:, 0] = [i * 0.01 for i in range(len(df_cleaned))]
+        
+        df_cleaned.to_csv(output_path, sep='\t', header=False, index=False)
+        
+        print(f" {filename} → {cleaned_filename}")
+        print(f"  Original: {original_rows:,} rows")
+        print(f"  Cleaned: {cleaned_rows:,} rows")
+        print(f"  Removed: {removed_rows:,} rows\n")
+        
+    except Exception as e:
+        print(f"✗ Error processing {filename}: {str(e)}\n")
+
+print("Initial cleaning complete!")
+
+# _______________________________________________
+# artifact code here
+
+def detect_ttl_pulses_custom(ttl_data, low_threshold=0.1, high_threshold=3.0):
+    """
+    Detect TTL pulses based on your specific TTL pattern
+    Your data shows low values (~0.024) and high values (~3.99)
+    """
+    # Find transitions from low to high 
+    high_mask = ttl_data > high_threshold
+    low_mask = ttl_data < low_threshold
+    
+    # Find pulse starts 
+    pulse_starts = []
+    for i in range(1, len(high_mask)):
+        if high_mask[i] and not high_mask[i-1]:
+            pulse_starts.append(i)
+    
+    # Find pulse ends
+    pulse_ends = []
+    for i in range(1, len(low_mask)):
+        if low_mask[i] and not low_mask[i-1]:
+            pulse_ends.append(i)
+    
+    print(f"Found {len(pulse_starts)} pulse starts and {len(pulse_ends)} pulse ends")
+    
+    # Return the main pulse boundaries (first start and last end)
+    if pulse_starts and pulse_ends:
+        return pulse_starts[0], pulse_ends[-1]
+    else:
+        return None, None
+
+def save_artifacts_file(artifacts_data, filename):
+    """Save removed artifacts to a TXT file"""
+    if artifacts_data:
+        with open(filename, 'w') as f:
+            f.write("start_index end_index start_time end_time artifact_type\n")
+            for artifact in artifacts_data:
+                f.write(f"{int(artifact[0])} {int(artifact[1])} {float(artifact[2]):.6f} {float(artifact[3]):.6f} {artifact[4]}\n")
+        print(f"Artifacts saved to: {filename}")
+    else:
+        with open(filename, 'w') as f:
+            f.write("start_index end_index start_time end_time artifact_type\n")
+        print(f"No artifacts found. Empty file created: {filename}")
+
+def interpolate_data_linear(time, F_value, TTL, artifacts_removed, fourth_column=None):
+    """
+    Fill holes in data using simple linear interpolation
+    """
+    has_fourth_column = fourth_column is not None
+    
+    if not artifacts_removed:
+        if has_fourth_column:
+            return time, F_value, TTL, fourth_column
+        else:
+            return time, F_value, TTL
+    
+    print(f"Interpolating {len(artifacts_removed)} artifact regions with linear interpolation...")
+    
+    # Create interpolated arrays 
+    time_interp = time.copy()
+    F_value_interp = F_value.copy()
+    TTL_interp = TTL.copy()
+    if has_fourth_column:
+        fourth_column_interp = fourth_column.copy()
+    
+    # For each artifact region, interpolate the missing values
+    for artifact_idx, artifact in enumerate(artifacts_removed):
+        start_idx = int(artifact[0])
+        end_idx = int(artifact[1])
+        
+        # Skip if invalid indices
+        if start_idx >= len(time) or end_idx >= len(time) or start_idx >= end_idx:
+            print(f"  Artifact {artifact_idx}: Invalid indices {start_idx} to {end_idx}, skipping")
+            continue
+        
+        # Find the nearest valid points before and after the artifact
+        # Look backward for a valid point before the artifact
+        before_idx = None
+        for i in range(start_idx - 1, -1, -1):
+            if i < len(time):
+                before_idx = i
+                break
+        
+        # Look forward for a valid point after the artifact
+        after_idx = None
+        for i in range(end_idx + 1, len(time)):
+            after_idx = i
+            break
+        
+        if before_idx is not None and after_idx is not None:
+            
+            # Get the values at the edges
+            time_before = time[before_idx]
+            time_after = time[after_idx]
+            
+            # Create time points for the gap
+            gap_time = time[start_idx:end_idx+1]
+            
+            # Linear interpolation for F_value
+            F_before = F_value[before_idx]
+            F_after = F_value[after_idx]
+            F_value_interp[start_idx:end_idx+1] = np.interp(
+                gap_time, [time_before, time_after], [F_before, F_after]
+            )
+            
+            # For TTL
+            TTL_before = TTL[before_idx]
+            TTL_after = TTL[after_idx]
+            TTL_interp[start_idx:end_idx+1] = np.interp(
+                gap_time, [time_before, time_after], [TTL_before, TTL_after]
+            )
+            
+            # Linear interpolation for fourth column if present
+            if has_fourth_column:
+                fourth_before = fourth_column[before_idx]
+                fourth_after = fourth_column[after_idx]
+                fourth_column_interp[start_idx:end_idx+1] = np.interp(
+                    gap_time, [time_before, time_after], [fourth_before, fourth_after]
+                )
+            
+            print(f"  Artifact {artifact_idx}: Filled indices {start_idx} to {end_idx} " + 
+                  f"(time {gap_time[0]:.2f} to {gap_time[-1]:.2f}s) " +
+                  f"using points at times {time_before:.2f} and {time_after:.2f}s")
+            
+        elif before_idx is not None:
+            # Only have point before - use constant value
+            print(f"  Artifact {artifact_idx}: Only point before available, extending constant value")
+            F_value_interp[start_idx:end_idx+1] = F_value[before_idx]
+            TTL_interp[start_idx:end_idx+1] = TTL[before_idx]
+            if has_fourth_column:
+                fourth_column_interp[start_idx:end_idx+1] = fourth_column[before_idx]
+                
+        elif after_idx is not None:
+            # Only have point after 
+            print(f"  Artifact {artifact_idx}: Only point after available, extending constant value")
+            F_value_interp[start_idx:end_idx+1] = F_value[after_idx]
+            TTL_interp[start_idx:end_idx+1] = TTL[after_idx]
+            if has_fourth_column:
+                fourth_column_interp[start_idx:end_idx+1] = fourth_column[after_idx]
+                
+        else:
+            # No valid points at all
+            print(f"  Artifact {artifact_idx}: No valid points found for interpolation")
+    
+    if has_fourth_column:
+        return time_interp, F_value_interp, TTL_interp, fourth_column_interp
+    else:
+        return time_interp, F_value_interp, TTL_interp
+
+def process_fiber_photometry_txt(filepath, window=40, output_folder=None):
+    """
+    Process fiber photometry data from TXT file with custom TTL detection
+    and save both cleaned data and removed artifacts
+    """
+    
+    # Set output folder
+    if output_folder is None:
+        output_folder = os.path.dirname(filepath)  
+    
+    # Create output folder if it doesn't exist
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    
+    # Get base name for output files
+    base_name = os.path.splitext(os.path.basename(filepath))[0]
+    
+    # Load data from TXT file
+    try:
+        data = np.loadtxt(filepath)
+        print(f"Data shape: {data.shape}")
+        print(f"Number of columns: {data.shape[1]}")
+    except Exception as e:
+        print(f"Error loading file: {e}")
+        return None
+    
+    # Store all original columns
+    time = data[:, 0]
+    F_value = data[:, 1]
+    TTL = data[:, 2]
+    
+    # If there's a 4th column store it too
+    if data.shape[1] >= 4:
+        fourth_column = data[:, 3]
+        has_fourth_column = True
+    else:
+        has_fourth_column = False
+    
+    print(f"Data loaded: {len(time)} points")
+    print(f"Time range: {time[0]:.2f} to {time[-1]:.2f} seconds")
+    print(f"F_value range: {np.min(F_value):.2f} to {np.max(F_value):.2f}")
+    print(f"TTL range: {np.min(TTL):.6f} to {np.max(TTL):.6f}")
+    if has_fourth_column:
+        print(f"Fourth column range: {np.min(fourth_column):.6f} to {np.max(fourth_column):.6f}")
+    
+    # Detect TTL pulses using threshold
+    pulse_start_idx, pulse_end_idx = detect_ttl_pulses_custom(TTL)
+    
+    if pulse_start_idx is not None and pulse_end_idx is not None:
+        print(f"TTL pulse start: index {pulse_start_idx}, time {time[pulse_start_idx]:.2f}s")
+        print(f"TTL pulse end: index {pulse_end_idx}, time {time[pulse_end_idx]:.2f}s")
+        
+        # Trim data to TTL pulse region 
+        time_trimmed = time[pulse_start_idx:pulse_end_idx + 1]
+        F_value_trimmed = F_value[pulse_start_idx:pulse_end_idx + 1]
+        TTL_trimmed = TTL[pulse_start_idx:pulse_end_idx + 1]
+        if has_fourth_column:
+            fourth_column_trimmed = fourth_column[pulse_start_idx:pulse_end_idx + 1]
+        
+    else:
+        print("Warning: Could not detect clear TTL pulses. Using full data range.")
+        time_trimmed = time.copy()
+        F_value_trimmed = F_value.copy()
+        TTL_trimmed = TTL.copy()
+        if has_fourth_column:
+            fourth_column_trimmed = fourth_column.copy()
+    
+    # Calculate duration
+    Duration = time_trimmed[-1] - time_trimmed[0]
+    print(f"Data duration after processing: {Duration:.2f} seconds")
+    
+    # Use the original time values
+    new_time = time_trimmed.copy()
+    
+    # Scale F values 
+    F = F_value_trimmed / 1000
+    
+    print(f"Final data length: {len(new_time)} points")
+    print(f"New time range: {new_time[0]:.2f} to {new_time[-1]:.2f} seconds")
+    
+    # Calculate derivative F_DIF
+    if len(new_time) > 1:
+        dt = new_time[1] - new_time[0]
+        F_DIF = np.diff(F) / dt
+    else:
+        print("Error: Not enough data points after trimming")
+        return None
+    
+    # Calculate bounds for artifact detection
+    DIF_average = np.mean(F_DIF)
+    Std_dev = np.std(F_DIF)
+    upper_bound = DIF_average + (20 * Std_dev)
+    lower_bound = DIF_average - (20 * Std_dev)
+    
+    print(f"Artifact detection bounds: [{lower_bound:.6f}, {upper_bound:.6f}]")
+    
+    # Initialize artifact detection arrays
+    PAS = []  # Positive Artifact Start
+    PAE = []  # Positive Artifact End
+    NAS = []  # Negative Artifact Start
+    NAE = []  # Negative Artifact End
+    
+    # Detect positive and negative artifacts
+    for i in range(len(F_DIF)):
+        # Positive artifacts
+        if F_DIF[i] >= upper_bound:
+            # Determine window sizes
+            if i <= window:
+                w1 = max(0, i - 2)
+                w2 = window
+            elif i + window >= len(F_DIF):
+                w1 = window
+                w2 = len(F_DIF) - (i + 1)
+            else:
+                w1 = window
+                w2 = window
+            
+            # Find start of artifact (left side)
+            K = []
+            start_range = max(0, i - w1)
+            for s in range(start_range, i + 1):
+                if F_DIF[s] < upper_bound:
+                    K.append(s)
+            if K:
+                real_index_S = K[-1]
+                PAS.append(real_index_S)
+            
+            # Find end of artifact (right side)
+            A = []
+            end_range = min(len(F_DIF), i + w2 + 1)
+            for ss in range(i, end_range):
+                if F_DIF[ss] < upper_bound:
+                    A.append(ss)
+                    break  
+            if A:
+                real_index_E = A[0]
+                PAE.append(real_index_E)
+        
+        # Negative artifacts
+        if F_DIF[i] <= lower_bound:
+            # Determine window sizes
+            if i <= window:
+                w1 = max(0, i - 2)
+                w2 = window
+            elif i + window >= len(F_DIF):
+                w1 = window
+                w2 = len(F_DIF) - (i + 1)
+            else:
+                w1 = window
+                w2 = window
+            
+            # Find start of artifact (left side)
+            M = []
+            start_range = max(0, i - w1)
+            for m in range(start_range, i + 1):
+                if F_DIF[m] > lower_bound:
+                    M.append(m)
+            if M:
+                real_index_Start_low_outlier = M[-1]
+                NAS.append(real_index_Start_low_outlier)
+            
+            # Find end of artifact (right side)
+            H = []
+            end_range = min(len(F_DIF), i + w2 + 1)
+            for mm in range(i, end_range):
+                if F_DIF[mm] > lower_bound:
+                    H.append(mm)
+                    break  
+            if H:
+                real_index_End_low_outlier = H[0]
+                NAE.append(real_index_End_low_outlier)
+    
+    print(f"Detected {len(PAS)} positive artifacts and {len(NAS)} negative artifacts")
+    
+    # Combine artifact start and end points
+    AS = sorted(set(NAS + PAS))
+    AE = sorted(set(NAE + PAE))
+    
+    print(f"Artifact starts: {AS}")
+    print(f"Artifact ends: {AE}")
+    
+    # Create copies for artifact removal 
+    time_clean = new_time.copy()
+    F_clean = F.copy()
+    F_value_clean = F_value_trimmed.copy()
+    TTL_clean = TTL_trimmed.copy()
+    if has_fourth_column:
+        fourth_column_clean = fourth_column_trimmed.copy()
+    
+    artifacts_removed = []
+    
+    # Remove each artifact region individually
+    # Work backwards to maintain correct indices
+    if len(AS) == len(AE) and len(AS) > 0:
+        print("Removing artifacts...")
+        for i in range(len(AS)-1, -1, -1):  # Reverse order
+            start_idx = AS[i]
+            end_idx = AE[i]
+            
+            # Only remove if it's a valid range
+            if start_idx < end_idx and end_idx < len(F_clean):
+                print(f"Removing artifact {i}: indices {start_idx} to {end_idx}")
+                
+                # Store artifact info
+                artifact_type = "single"
+                artifacts_removed.append([start_idx, end_idx, new_time[start_idx], new_time[end_idx], artifact_type])
+                
+                # Remove from all clean arrays
+                time_clean = np.delete(time_clean, slice(start_idx, end_idx + 1))
+                F_clean = np.delete(F_clean, slice(start_idx, end_idx + 1))
+                F_value_clean = np.delete(F_value_clean, slice(start_idx, end_idx + 1))
+                TTL_clean = np.delete(TTL_clean, slice(start_idx, end_idx + 1))
+                if has_fourth_column:
+                    fourth_column_clean = np.delete(fourth_column_clean, slice(start_idx, end_idx + 1))
+            else:
+                print(f"Skipping invalid artifact {i}: start={start_idx}, end={end_idx}, F_clean_length={len(F_clean)}")
+    else:
+        print(f"Mismatch in artifact counts: {len(AS)} starts vs {len(AE)} ends")
+    
+    # Sort artifacts by start time for the output file
+    artifacts_removed.sort(key=lambda x: x[0])
+    
+    # Save artifacts removed to file
+    artifacts_filename = os.path.join(output_folder, f'{base_name}_artifacts_removed.txt')
+    save_artifacts_file(artifacts_removed, artifacts_filename)
+    
+    print(f"After artifact removal: {len(F_clean)} data points remaining")
+    
+    # If no artifacts were removed, use original data
+    if len(F_clean) == 0:
+        print("Warning: No data left after artifact removal. Using original data.")
+        time_clean = new_time.copy()
+        F_clean = F.copy()
+        F_value_clean = F_value_trimmed.copy()
+        TTL_clean = TTL_trimmed.copy()
+        if has_fourth_column:
+            fourth_column_clean = fourth_column_trimmed.copy()
+        time_interp = time_clean
+        F_value_interp = F_value_clean
+        TTL_interp = TTL_clean
+        if has_fourth_column:
+            fourth_column_interp = fourth_column_clean
+    else:
+        # insert to fill the holes left by artifact removal
+        print("\nFilling holes with linear interpolation...")
+        if has_fourth_column:
+            time_interp, F_value_interp, TTL_interp, fourth_column_interp = interpolate_data_linear(
+                time_clean, F_value_clean, TTL_clean, artifacts_removed, fourth_column_clean
+            )
+        else:
+            time_interp, F_value_interp, TTL_interp = interpolate_data_linear(
+                time_clean, F_value_clean, TTL_clean, artifacts_removed
+            )
+    
+    # Save inserted data to TXT file
+    if has_fourth_column:
+        interpolated_data = np.column_stack((time_interp, F_value_interp, TTL_interp, fourth_column_interp))
+        interpolated_filename = os.path.join(output_folder, f'{base_name}_artifact_removed_interpolated.txt')
+        np.savetxt(interpolated_filename, interpolated_data, 
+                   header='Time F_value TTL Fourth_Column', fmt='%.6f')
+    else:
+        interpolated_data = np.column_stack((time_interp, F_value_interp, TTL_interp))
+        interpolated_filename = os.path.join(output_folder, f'{base_name}_artifact_removed_interpolated.txt')
+        np.savetxt(interpolated_filename, interpolated_data, 
+                   header='Time F_value TTL', fmt='%.6f')
+    
+    print(f"\nProcessing complete for {filepath}")
+    print(f"Original data points: {len(F)}")
+    print(f"Data points after artifact removal: {len(F_clean)}")
+    print(f"Data points after interpolation: {len(time_interp)}")
+    print(f"Artifacts removed: {len(artifacts_removed)}")
+    print(f"Interpolated data saved to: {interpolated_filename}")
+    print(f"Artifacts info saved to: {artifacts_filename}")
+    
+    return {
+        'time_interp': time_interp,
+        'F_value_interp': F_value_interp,
+        'TTL_interp': TTL_interp,
+        'artifacts_removed': artifacts_removed,
+        'original_length': len(F),
+        'interpolated_length': len(time_interp),
+        'interpolated_filename': interpolated_filename  
+    }
+
+print("\n=== Starting Artifact Removal Processing ===")
+
+# Get all cleaned files from output folder
+cleaned_files = [f for f in os.listdir(output_folder) if f.endswith('_cleaned.txt') and os.path.isfile(os.path.join(output_folder, f))]
+
+print(f"Found {len(cleaned_files)} cleaned files to process for artifacts\n")
+
+final_cleaned_files = []  # Store the final cleaned files for chunking
+
+for cleaned_filename in cleaned_files:
+    input_path = os.path.join(output_folder, cleaned_filename)
+    
+    try:
+        print(f"Processing {cleaned_filename} for artifact removal...")
+        result = process_fiber_photometry_txt(input_path, output_folder=output_folder)
+        
+        if result:
+            print(f"✓ Successfully processed {cleaned_filename}")
+            print(f"  Removed {len(result['artifacts_removed'])} artifact regions")
+            print(f"  Data reduction: {result['original_length']} → {result['interpolated_length']} points")
+            print(f"  Percentage kept: {result['interpolated_length']/result['original_length']*100:.1f}%\n")
+            final_cleaned_files.append(result['interpolated_filename'])
+        else:
+            print(f"✗ Failed to process {cleaned_filename}\n")
+            
+    except Exception as e:
+        print(f"Error processing {cleaned_filename} for artifacts: {str(e)}\n")
+
+print("Artifact removal and interpolation complete!")
+
+# _______________________________________________
+# the chunking code 
+
+def split_multiple():
+    # Use only the final interpolated files
+    input_files = [os.path.basename(f) for f in final_cleaned_files]
+    
+    # Define the time ranges for each chunk
+    time_ranges = [
+        (285, 345),
+        (405, 465),
+        (645, 705),
+        (1005, 1065),
+        (1125, 1185),
+        (1425, 1485)
+    ]
+    
+    for input_file in input_files:
+        input_path = os.path.join(output_folder, input_file)
+        base_name = os.path.splitext(input_file)[0].replace('_artifact_removed_interpolated', '')
+        
+        print(f"Processing: {input_file}")
+        
+        # Process each time range
+        for i, (start_value, end_value) in enumerate(time_ranges, 1):
+            output_file = os.path.join(output_folder, f"{base_name}_tone{i}.txt")
+            
+            line_counter = 0
+            started = False
+            
+            with open(input_path, 'r') as infile, open(output_file, 'w') as outfile:
+                for line in infile:
+                    if not line.strip():
+                        continue
+                        
+                    try:
+                        first_value = float(line.split()[0])
+                    except (ValueError, IndexError):
+                        continue
+                    
+                    if not started and first_value >= start_value:
+                        started = True
+                        print(f"Chunk {i}: Started at value: {first_value}")
+                    
+                    if started and first_value <= end_value:
+                        outfile.write(line)
+                        line_counter += 1
+                    
+                    if started and first_value > end_value:
+                        print(f"Chunk {i}: Reached end value: {first_value}")
+                        break
+            
+            print(f"Created: {output_file}")
+            print(f"Processed {line_counter} lines from {start_value} to {end_value}")
+            print("-" * 50)
+
+# Run chunking only on files
+print("\n=== Starting File Chunking ===")
+split_multiple()
+print("All processing complete!")
+
+print(f"\n=== FINAL OUTPUT FILES ===")
+print("Interpolated files (with artifacts removed and holes filled):")
+for f in final_cleaned_files:
+    print(f"  {os.path.basename(f)}")
+
+print("\nArtifact removal logs:")
+artifact_logs = [f for f in os.listdir(output_folder) if f.endswith('_artifacts_removed.txt')]
+for f in artifact_logs:
+    print(f"  {f}")
+
+print("\nChunked files:")
+chunked_files = [f for f in os.listdir(output_folder) if '_tone' in f and f.endswith('.txt')]
+for f in chunked_files:
+    print(f"  {f}")
+
+
+
+
+
+
+
+
+
+
+    
