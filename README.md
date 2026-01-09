@@ -1,2 +1,6 @@
 # Fiber-Photometry-
-Remove artifacts from fiber photometry data outside of 20 standard deviations, the wholes were then filled using a linear model. The file was then split into 6 seperate files based on the time of the tone.
+Developed pipeline for fiber photometry, integrating artifact corrections and experiment aligned segmentation
+• Implemented TTL-based event detection to identify experimental epochs and align neural signals with behavioral stimuli
+• Designed a derivative based artifact detection method to identify artifacts in fluorescence time series data
+• Removed corrupted signals and reconstructed missing data via linear interpolation
+• Ensured synchronized processing across multiple signal channels
